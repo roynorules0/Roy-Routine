@@ -1,0 +1,6 @@
+{
+  "name": "Roy Routine X",
+  "description": "Futuristic cinematic AI operating system for extreme discipline, routine tracking, fitness, and self-improvement with Guardian AI correction.",
+  "requestFramePermissions": ["geolocation"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

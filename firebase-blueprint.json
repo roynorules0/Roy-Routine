@@ -1,0 +1,56 @@
+{
+  "entities": {
+    "User": {
+      "title": "User Profile",
+      "description": "User account settings, streak, points, mood and Google Fit connection settings.",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string" },
+        "email": { "type": "string" },
+        "displayName": { "type": "string" },
+        "photoURL": { "type": "string" },
+        "points": { "type": "integer" },
+        "streak": { "type": "integer" },
+        "maxStreak": { "type": "integer" },
+        "currentMood": { "type": "string" },
+        "guardianRank": { "type": "string" },
+        "isFitConnected": { "type": "boolean" },
+        "emailRemindersEnabled": { "type": "boolean" },
+        "fitSteps": { "type": "integer" },
+        "fitDistance": { "type": "number" },
+        "fitCalories": { "type": "integer" },
+        "fitActiveMinutes": { "type": "integer" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["uid", "email", "displayName", "points", "streak"]
+    },
+    "Task": {
+      "title": "Task",
+      "description": "A daily task on the user's checklist.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "title": { "type": "string" },
+        "category": { "type": "string" },
+        "time": { "type": "string" },
+        "points": { "type": "integer" },
+        "completed": { "type": "boolean" },
+        "completedAt": { "type": "string", "format": "date-time" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "systemGenerated": { "type": "boolean" },
+        "date": { "type": "string" }
+      },
+      "required": ["id", "title", "category", "time", "points", "completed", "createdAt", "date"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": "User",
+      "description": "Stores user profiles with their discipline streak and points."
+    },
+    "/users/{userId}/tasks/{taskId}": {
+      "schema": "Task",
+      "description": "Stores the individual daily routines and checklist items for each user."
+    }
+  }
+}
