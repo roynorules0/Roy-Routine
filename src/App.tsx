@@ -252,6 +252,27 @@ export default function App() {
   const [telegramFailureModal, setTelegramFailureModal] = useState(false);
   const [telegramModalError, setTelegramModalError] = useState("");
 
+  // Automated Telegram Discipline Alert States
+  const [telegramAlertsEnabled, setTelegramAlertsEnabled] = useState<boolean>(() => {
+    return localStorage.getItem("telegram_alerts_enabled") !== "false";
+  });
+  const [alertFrequency, setAlertFrequency] = useState<"30min" | "1hr" | "2hr">(() => {
+    return (localStorage.getItem("telegram_alert_frequency") as any) || "1hr";
+  });
+  const [telegramSilentMode, setTelegramSilentMode] = useState<boolean>(() => {
+    return localStorage.getItem("telegram_silent_mode") === "true";
+  });
+  const [motivationIntensity, setMotivationIntensity] = useState<"low" | "medium" | "high">(() => {
+    return (localStorage.getItem("telegram_motivation_intensity") as any) || "medium";
+  });
+  const [lastAutoAlertTime, setLastAutoAlertTime] = useState<number>(() => {
+    return parseInt(localStorage.getItem("telegram_last_auto_alert_time") || "0", 10);
+  });
+  const [isDayCompletedMessageSent, setIsDayCompletedMessageSent] = useState<string>(() => {
+    return localStorage.getItem("telegram_is_day_completed_message_sent") || "";
+  });
+  const [activeAppNotification, setActiveAppNotification] = useState<{ title: string; body: string; type: "broadcast_preparing" | "broadcast_sent" | "success" } | null>(null);
+
   // Motivation Modal State
   const [isMotivationModalOpen, setIsMotivationModalOpen] = useState(false);
   const [modalMotivation, setModalMotivation] = useState("");
@@ -267,6 +288,229 @@ export default function App() {
       return () => clearTimeout(timer);
     }
   }, [emailNotificationToast]);
+
+  // Sync Telegram Settings to LocalStorage
+  useEffect(() => {
+    localStorage.setItem("telegram_alerts_enabled", String(telegramAlertsEnabled));
+  }, [telegramAlertsEnabled]);
+
+  useEffect(() => {
+    localStorage.setItem("telegram_alert_frequency", alertFrequency);
+  }, [alertFrequency]);
+
+  useEffect(() => {
+    localStorage.setItem("telegram_silent_mode", String(telegramSilentMode));
+  }, [telegramSilentMode]);
+
+  useEffect(() => {
+    localStorage.setItem("telegram_motivation_intensity", motivationIntensity);
+  }, [motivationIntensity]);
+
+  useEffect(() => {
+    localStorage.setItem("telegram_last_auto_alert_time", String(lastAutoAlertTime));
+  }, [lastAutoAlertTime]);
+
+  useEffect(() => {
+    localStorage.setItem("telegram_is_day_completed_message_sent", isDayCompletedMessageSent);
+  }, [isDayCompletedMessageSent]);
+
+  // Automated Telegram alert scheduling checker
+  useEffect(() => {
+    const schedulingInterval = setInterval(async () => {
+      if (!telegramAlertsEnabled || !profile || tasks.length === 0) return;
+
+      const totalCount = tasks.length;
+      const completedCount = tasks.filter(t => t.completed).length;
+      const todayString = getLocalDateString();
+
+      // Case A: 100% Completed Target Success Alert
+      if (totalCount > 0 && completedCount === totalCount) {
+        if (isDayCompletedMessageSent !== todayString) {
+          // Send automatic Success Alert to Telegram
+          setIsTelegramLoading(true);
+          try {
+            // Internal App Alert popup first
+            setActiveAppNotification({
+              title: "✅ TARGET COMPLETED PROTOCOL",
+              body: "Discipline confirmed! Dispatching target completion telemetry to secure bot...",
+              type: "broadcast_preparing"
+            });
+
+            // Format message
+            const formattedMessage = `<b>✅ DISCIPLINE MAINTAINED</b>\nToday's target completed successfully!\n\n🎖️ <b>Perfect Score:</b> ${completedCount}/${totalCount} Tasks\n🔥 <b>Streak Protection:</b> Secured\n📈 <i>Keep up the incredible consistency!</i>\n\n— Roy Routine AI System\nPowered by Roy No Rules • Since 2026`;
+
+            // Call telegram send API
+            const response = await fetch("https://api.telegram.org/bot8702263976:AAHkSItI-2YDwqo7URhSIwPTf4a0Z_yRK94/sendMessage", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                chat_id: "8661147262",
+                text: formattedMessage,
+                parse_mode: "HTML",
+                disable_notification: telegramSilentMode
+              })
+            });
+
+            const data = await response.json();
+            const isOk = response.ok && data.ok;
+
+            // Log
+            const newLog = {
+              id: `tg_auto_${Date.now()}`,
+              email: "Telegram Chat ID: 8661147262",
+              subject: "✅ Target Completed Automatically",
+              title: "Discipline Maintained",
+              body: "All assigned blocks are marked finished. Today's target completed successfully.",
+              timestamp: new Date().toISOString(),
+              status: isOk ? "Delivered" : "Failed",
+              type: "SUCCESS"
+            };
+
+            setSentEmails(prev => {
+              const updated = [newLog, ...prev];
+              localStorage.setItem("roy_sent_emails", JSON.stringify(updated));
+              return updated;
+            });
+
+            if (isOk) {
+              setIsDayCompletedMessageSent(todayString);
+              setActiveAppNotification({
+                title: "TELEGRAM BROADCAST SUCCESS",
+                body: "✅ Today's completion report is now broadcasted in your Telegram bot.",
+                type: "success"
+              });
+              setTimeout(() => setActiveAppNotification(null), 5000);
+            } else {
+              console.warn("Telegram automated success broadcast failed:", data.description);
+            }
+          } catch (e) {
+            console.error("Failed to dispatcher auto success message:", e);
+          } finally {
+            setIsTelegramLoading(false);
+          }
+        }
+        return; // No need to check for warnings if they completed everything
+      }
+
+      // Case B: Incomplete Target Warning Alert
+      if (totalCount > 0 && completedCount < totalCount) {
+        let frequencyMs = 3600000; // 1 hour
+        if (alertFrequency === "30min") frequencyMs = 1800000;
+        else if (alertFrequency === "2hr") frequencyMs = 7200000;
+
+        const now = Date.now();
+        const timeSinceLastAlert = now - lastAutoAlertTime;
+
+        if (timeSinceLastAlert >= frequencyMs) {
+          setIsTelegramLoading(true);
+
+          try {
+            // Select random premium motivational alert variation
+            const randomAlerts = [
+              {
+                emoji: "⚠️",
+                title: "⚠️ ROY ROUTINE DISCIPLINE ALERT",
+                body: "Your daily mission is still incomplete.\n\n⏳ Time is moving.\n🔥 Discipline creates legends.\n📈 Your streak depends on today's actions.\n\nComplete your targets now before your momentum breaks."
+              },
+              {
+                emoji: "⚡",
+                title: "⚡ ROY ROUTINE VIGILANCE BROADCAST",
+                body: "Laziness detected. Tasks remain incomplete.\n\n💀 Excuses are for the weak, real warriors take action.\n⌛ Every passive hour is a missed opportunity.\n🎖️ Build consistency and execute with pride."
+              },
+              {
+                emoji: "🚨",
+                title: "🚨 CRITICAL GUARDIAN DISCIPLINE PROTOCOL",
+                body: "We are tracking pending work targets on your board.\n\n🔥 Breaking your routine is an irreversible failure.\n🎯 Completing current checklists maintains high performance.\n🚀 Stand up and eliminate all delay vectors."
+              },
+              {
+                emoji: "⚔️",
+                title: "⚔️ CORE ROUTINE DEFICIT WARNING",
+                body: "System demands immediate checklist resolution.\n\n⌛ There is no starting tomorrow. Accomplish tasks today.\n⛓️ Break the shackles of procrastination.\n🏆 The Guardian AI system is monitoring closely!"
+              }
+            ];
+
+            const alertTemplate = randomAlerts[Math.floor(Math.random() * randomAlerts.length)];
+
+            // Adjust body slightly according to Motivation Intensity
+            let intensitySubtitle = "";
+            let intenseSuffix = "";
+            if (motivationIntensity === "low") {
+              intensitySubtitle = "⚠️ <i>Gentle Reminder</i>";
+              intenseSuffix = "\n\nYou got this! Just take one step today.";
+            } else if (motivationIntensity === "high") {
+              intensitySubtitle = "🔥 <b>CRITICAL AGGRESSIVE STREAK THREAT</b>";
+              intenseSuffix = "\n\n🚨 FAILURE WILL NOT BE TOLERATED! ENFORCE DISCIPLINE ONCE AND FOR ALL!";
+            } else {
+              intensitySubtitle = "🛡️ <b>STANDARD VIGILANCE MONITORING</b>";
+            }
+
+            const alertTitle = alertTemplate.title;
+            const alertBodyFormatted = `<b>${alertTitle}</b>\n${intensitySubtitle}\n\n${alertTemplate.body}${intenseSuffix}\n\n— Roy Routine AI System\nPowered by Roy No Rules • Since 2026`;
+
+            // Active App Alert Popup
+            setActiveAppNotification({
+              title: "⚠️ TELEGRAM ALERT ENQUEUED",
+              body: `Discipline deficit detected (${completedCount}/${totalCount} done). Broadcast warning triggers in 3 seconds...`,
+              type: "broadcast_preparing"
+            });
+
+            // Give the user a 3 second heads-up before actual Telegram dispatch
+            await new Promise(resolve => setTimeout(resolve, 3000));
+
+            const response = await fetch("https://api.telegram.org/bot8702263976:AAHkSItI-2YDwqo7URhSIwPTf4a0Z_yRK94/sendMessage", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                chat_id: "8661147262",
+                text: alertBodyFormatted,
+                parse_mode: "HTML",
+                disable_notification: telegramSilentMode
+              })
+            });
+
+            const data = await response.json();
+            const isOk = response.ok && data.ok;
+
+            // Log
+            const newLog = {
+              id: `tg_auto_${Date.now()}`,
+              email: "Telegram Chat ID: 8661147262",
+              subject: alertTitle,
+              title: "Incomplete Target Warning",
+              body: alertTemplate.body.replace(/\n/g, " "),
+              timestamp: new Date().toISOString(),
+              status: isOk ? "Delivered" : "Failed",
+              type: "ROUTINE_MISSED"
+            };
+
+            setSentEmails(prev => {
+              const updated = [newLog, ...prev];
+              localStorage.setItem("roy_sent_emails", JSON.stringify(updated));
+              return updated;
+            });
+
+            if (isOk) {
+              setLastAutoAlertTime(now);
+              setActiveAppNotification({
+                title: "VIGILANCE ALARM TRANSMITTED",
+                body: "⚡ Severe alerting broadcast delivered successfully to Telegram Bot.",
+                type: "broadcast_sent"
+              });
+              setTimeout(() => setActiveAppNotification(null), 5000);
+            } else {
+              console.warn("Telegram automated alert broadcast failed:", data.description);
+            }
+          } catch (e) {
+            console.error("Failed to dispatcher auto alert:", e);
+          } finally {
+            setIsTelegramLoading(false);
+          }
+        }
+      }
+    }, 10000); // Check every 10 seconds
+
+    return () => clearInterval(schedulingInterval);
+  }, [telegramAlertsEnabled, profile, tasks, alertFrequency, telegramSilentMode, motivationIntensity, lastAutoAlertTime, isDayCompletedMessageSent]);
 
   // Live IST Time update
   useEffect(() => {
@@ -1258,6 +1502,55 @@ export default function App() {
               : "bg-night-flow"
       }`}
     >
+      {/* Floating App Notification popup */}
+      <AnimatePresence>
+        {activeAppNotification && (
+          <motion.div
+            initial={{ opacity: 0, y: -50, scale: 0.9 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            exit={{ opacity: 0, y: -30, scale: 0.95 }}
+            style={{ zIndex: 999999 }}
+            className="fixed top-6 right-6 max-w-sm w-full bg-slate-950/95 border border-sky-500/30 rounded-2xl p-5 shadow-[0_0_30px_rgba(14,165,233,0.3)] backdrop-blur-xl text-left overflow-hidden"
+          >
+            <div className="absolute inset-x-0 top-0 h-[2.5px] bg-sky-500 animate-pulse" />
+            <div className="flex gap-3">
+              <div className={`p-2.5 rounded-xl ${
+                activeAppNotification.type === "broadcast_preparing" 
+                  ? "bg-amber-500/10 text-amber-400 border border-amber-500/20 animate-pulse" 
+                  : activeAppNotification.type === "success" 
+                  ? "bg-emerald-500/10 text-emerald-400 border border-emerald-500/20" 
+                  : "bg-sky-500/10 text-sky-400 border border-sky-500/20"
+              }`}>
+                {activeAppNotification.type === "broadcast_preparing" ? (
+                  <AlertTriangle className="w-5 h-5 animate-bounce" />
+                ) : activeAppNotification.type === "success" ? (
+                  <CheckCircle2 className="w-5 h-5 animate-pulse" />
+                ) : (
+                  <Send className="w-5 h-5" />
+                )}
+              </div>
+              <div className="flex-grow">
+                <h4 className="text-xs font-black text-white uppercase tracking-wider">
+                  {activeAppNotification.title}
+                </h4>
+                <p className="text-[11px] text-slate-300 mt-1 leading-normal font-medium">
+                  {activeAppNotification.body}
+                </p>
+                <div className="mt-3 flex items-center justify-between text-[9px] text-slate-500 font-mono">
+                  <span>REAL-TIME DISPATCH</span>
+                  <span className="text-sky-400/80 font-bold">SECURE BOT-Vigilance</span>
+                </div>
+              </div>
+              <button 
+                onClick={() => setActiveAppNotification(null)}
+                className="text-slate-500 hover:text-white transition duration-150 p-1 self-start cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
       {/* Cinematic Ambient Depth Effects & Orbs */}
       <div className="absolute inset-0 pointer-events-none z-0 overflow-hidden" id="dynamic-ambient-glow">
         <div className="absolute top-1/4 left-1/4 w-96 h-96 bg-cyan-500/10 rounded-full blur-[120px] atmospheric-orb-1 pointer-events-none" />
@@ -1508,11 +1801,29 @@ export default function App() {
 
         {/* Loading Indicator */}
         {loadingAuth && (
-          <div className="flex-grow flex items-center justify-center h-64">
-            <div className="text-center">
-              <RefreshCw className="w-10 h-10 text-blue-500 animate-spin mx-auto mb-4" />
-              <p className="text-xs font-mono tracking-widest uppercase text-slate-400">Synthesizing Shield Aura...</p>
-            </div>
+          <div className="fixed inset-0 bg-slate-950 z-[99999] flex flex-col items-center justify-center">
+            {/* Ambient cyber grids */}
+            <div className="absolute inset-0 bg-[linear-gradient(to_right,#0f172a_1px,transparent_1px),linear-gradient(to_bottom,#0f172a_1px,transparent_1px)] bg-[size:4rem_4rem] [mask-image:radial-gradient(ellipse_60%_50%_at_50%_50%,#000_70%,transparent_100%)] opacity-35 pointer-events-none" />
+            <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-96 h-96 bg-blue-500/10 rounded-full blur-3xl pointer-events-none" />
+            
+            <motion.div 
+              initial={{ opacity: 0, scale: 0.95 }}
+              animate={{ opacity: 1, scale: 1 }}
+              transition={{ duration: 0.5 }}
+              className="text-center relative z-10 px-6"
+            >
+              <div className="relative w-16 h-16 mx-auto mb-6 flex items-center justify-center">
+                <div className="absolute inset-0 rounded-full border-2 border-slate-900" />
+                <div className="absolute inset-0 rounded-full border-2 border-t-sky-500 border-r-sky-500 animate-spin" />
+                <Zap className="w-6 h-6 text-sky-400 animate-pulse" />
+              </div>
+              <h2 className="text-lg font-black text-white uppercase tracking-widest font-sans mb-2">
+                Initializing Roy Routine...
+              </h2>
+              <p className="text-[10px] font-mono tracking-widest uppercase text-slate-500 animate-pulse">
+                Establishing Quantum Vigilance Engine
+              </p>
+            </motion.div>
           </div>
         )}
 
@@ -2843,38 +3154,166 @@ export default function App() {
                   </div>
 
                   {/* Telegram & Alert controls */}
-                  <div className="glass-panel rounded-2xl p-6 border-white/5 text-left bg-slate-950/20">
-                    <h3 className="text-base font-extrabold text-white flex items-center gap-2 mb-1">
-                      <Send className="text-sky-400 w-5 h-5 animate-pulse" />
-                      Telegram Alert Configuration
-                    </h3>
-                    <p className="text-xs text-slate-400 mb-4 trailing-normal">
-                      Set up notifications dispatch guidelines. When enabled, missing your daily routine will automatically broadcast strict and immediate warnings to your Telegram channel.
-                    </p>
+                  <div className="glass-panel rounded-2xl p-6 border border-white/10 text-left bg-slate-950/40 relative overflow-hidden shadow-[0_0_25px_rgba(14,165,233,0.1)]">
+                    <div className="absolute top-0 right-0 w-44 h-44 bg-sky-500/10 rounded-full blur-3xl pointer-events-none" />
+                    <div className="absolute -bottom-10 -left-10 w-36 h-36 bg-blue-500/5 rounded-full blur-2xl pointer-events-none" />
+                    
+                    <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3 border-b border-white/5 pb-4 mb-5">
+                      <div>
+                        <h3 className="text-base font-black text-white flex items-center gap-2">
+                          <Send className="text-sky-400 w-5 h-5 animate-pulse" />
+                          Telegram Discipline Alert System
+                        </h3>
+                        <p className="text-xs text-slate-400 mt-1 leading-normal">
+                          Advanced automated vigilance dispatcher. Direct integration with Roy No Rules Bot API.
+                        </p>
+                      </div>
+                      
+                      {/* Global Enable Switch */}
+                      <button
+                        onClick={() => setTelegramAlertsEnabled(!telegramAlertsEnabled)}
+                        className={`px-4 py-2 rounded-xl border font-black text-2xs uppercase tracking-widest transition-all duration-200 cursor-pointer flex items-center gap-2 ${
+                          telegramAlertsEnabled 
+                            ? "bg-sky-500/10 text-sky-400 border-sky-500/35 shadow-[0_0_15px_rgba(14,165,233,0.15)]" 
+                            : "bg-white/5 text-slate-400 border-white/10"
+                        }`}
+                      >
+                        <span className={`w-2 h-2 rounded-full ${telegramAlertsEnabled ? "bg-sky-400 animate-ping" : "bg-slate-500"}`} />
+                        {telegramAlertsEnabled ? "Vigilance Active" : "System Offline"}
+                      </button>
+                    </div>
 
-                    <div className="flex flex-col md:flex-row items-stretch md:items-center gap-4 justify-between p-4 bg-slate-950/50 rounded-xl border border-white/5">
+                    {/* Alert Options Grid */}
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-5">
+                      
+                      {/* Frequency Setting */}
+                      <div className="bg-black/30 border border-white/5 rounded-xl p-4 flex flex-col justify-between">
+                        <div>
+                          <span className="text-[10px] font-extrabold text-sky-400 uppercase tracking-widest block mb-1">
+                            Alert Frequency
+                          </span>
+                          <p className="text-[11px] text-slate-400 leading-normal mb-3">
+                            Time delay of repeating check alerts if targets remain incomplete for the day.
+                          </p>
+                        </div>
+                        <div className="flex bg-slate-950 p-1 rounded-xl border border-white/5 gap-1">
+                          {(["30min", "1hr", "2hr"] as const).map((freq) => (
+                            <button
+                              key={freq}
+                              onClick={() => setAlertFrequency(freq)}
+                              className={`flex-1 py-1.5 rounded-lg font-black text-2xs uppercase tracking-wider transition-all cursor-pointer ${
+                                alertFrequency === freq 
+                                  ? "bg-sky-500/15 text-sky-300 border border-sky-500/20" 
+                                  : "text-slate-500 hover:text-slate-300"
+                              }`}
+                            >
+                              {freq === "30min" ? "30 Min" : freq === "1hr" ? "1 Hour" : "2 Hours"}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+
+                      {/* Silent Protocol Setup */}
+                      <div className="bg-black/30 border border-white/5 rounded-xl p-4 flex flex-col justify-between">
+                        <div>
+                          <span className="text-[10px] font-extrabold text-indigo-400 uppercase tracking-widest block mb-1">
+                            Silent Delivery Protocol
+                          </span>
+                          <p className="text-[11px] text-slate-400 leading-normal mb-3">
+                            Mute alert audio & vibration on your phone receiver while keeping vigilance dispatches active.
+                          </p>
+                        </div>
+                        <div className="flex bg-slate-950 p-1 rounded-xl border border-white/5 gap-1">
+                          <button
+                            onClick={() => setTelegramSilentMode(true)}
+                            className={`flex-1 py-1.5 rounded-lg font-black text-2xs uppercase tracking-wider transition-all cursor-pointer ${
+                              telegramSilentMode 
+                                ? "bg-indigo-500/15 text-indigo-300 border border-indigo-500/20" 
+                                : "text-slate-500 hover:text-slate-305"
+                            }`}
+                          >
+                            Silent
+                          </button>
+                          <button
+                            onClick={() => setTelegramSilentMode(false)}
+                            className={`flex-1 py-1.5 rounded-lg font-black text-2xs uppercase tracking-wider transition-all cursor-pointer ${
+                              !telegramSilentMode 
+                                ? "bg-cyan-500/15 text-cyan-300 border border-cyan-500/20" 
+                                : "text-slate-500 hover:text-slate-300"
+                            }`}
+                          >
+                            Standard Sound
+                          </button>
+                        </div>
+                      </div>
+
+                      {/* Motivation Intensity Selector */}
+                      <div className="bg-black/30 border border-white/5 rounded-xl p-4 flex flex-col justify-between">
+                        <div>
+                          <span className="text-[10px] font-extrabold text-orange-400 uppercase tracking-widest block mb-1">
+                            Motivation Intensity
+                          </span>
+                          <p className="text-[11px] text-slate-400 leading-normal mb-3">
+                            Tailor aggression of broadcast messages. Stronger factors utilize stricter tones.
+                          </p>
+                        </div>
+                        <div className="flex bg-slate-950 p-1 rounded-xl border border-white/5 gap-1">
+                          {(["low", "medium", "high"] as const).map((intensity) => (
+                            <button
+                              key={intensity}
+                              onClick={() => setMotivationIntensity(intensity)}
+                              className={`flex-1 py-1.5 rounded-lg font-black text-2xs uppercase tracking-wider transition-all cursor-pointer ${
+                                motivationIntensity === intensity 
+                                  ? intensity === "high"
+                                    ? "bg-red-500/15 text-red-300 border border-red-500/20"
+                                    : intensity === "medium"
+                                    ? "bg-amber-500/15 text-amber-300 border border-amber-500/20"
+                                    : "bg-emerald-500/15 text-emerald-300 border border-emerald-500/20"
+                                  : "text-slate-500 hover:text-slate-300"
+                              }`}
+                            >
+                              {intensity}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+
+                    </div>
+
+                    {/* Bot Integration Telemetry Details */}
+                    <div className="flex flex-col md:flex-row items-stretch md:items-center gap-4 justify-between p-4 bg-slate-950/60 rounded-xl border border-white/5">
                       <div className="flex-grow max-w-md">
-                        <label className="text-[10px] font-extrabold text-sky-400 uppercase tracking-widest block mb-1">
-                          Active Telegram Integration Credentials
+                        <label className="text-[10px] font-extrabold text-slate-400 uppercase tracking-widest block mb-1 font-mono">
+                          TELEMETRY METADATA CONNECTION
                         </label>
                         <div className="flex flex-col gap-2 mt-2">
-                          <div className="flex justify-between items-center text-xs bg-slate-950 border border-white/5 rounded-lg px-3 py-1.5 font-mono text-slate-300">
-                            <span className="text-slate-500 font-extrabold uppercase text-[9px] tracking-wide">Bot Token</span>
-                            <span className="text-sky-400 font-bold">8702263976:AAHk...yRK94</span>
+                          <div className="flex justify-between items-center text-xs bg-slate-950/70 border border-white/5 rounded-lg px-3 py-1.5 font-mono text-slate-300">
+                            <span className="text-slate-500 font-extrabold uppercase text-[9px] tracking-wide">Secure Bot ID</span>
+                            <span className="text-sky-400 font-bold">8702263976 (Roy No Rules Bot)</span>
                           </div>
-                          <div className="flex justify-between items-center text-xs bg-slate-950 border border-white/5 rounded-lg px-3 py-1.5 font-mono text-slate-300">
-                            <span className="text-slate-500 font-extrabold uppercase text-[9px] tracking-wide">Chat ID</span>
+                          <div className="flex justify-between items-center text-xs bg-slate-950/70 border border-white/5 rounded-lg px-3 py-1.5 font-mono text-slate-300">
+                            <span className="text-slate-500 font-extrabold uppercase text-[9px] tracking-wide">Target Chat ID</span>
                             <span className="text-sky-400 font-bold">8661147262</span>
                           </div>
                         </div>
                       </div>
 
-                      <div className="flex items-end justify-end mt-2 md:mt-0">
+                      <div className="flex flex-col gap-2 justify-end self-end sm:self-auto w-full md:w-auto">
+                        <div className="p-3 rounded-lg bg-black/40 border border-white/5 text-left mb-1 sm:min-w-[190px]">
+                          <span className="text-[9px] font-bold text-slate-500 block uppercase font-mono tracking-widest">SCHEDULING STATE</span>
+                          <span className="text-2xs font-extrabold text-slate-300 font-mono mt-1 block">
+                            Last Transmit: <span className="text-sky-400">{lastAutoAlertTime > 0 ? new Date(lastAutoAlertTime).toLocaleTimeString() : "None"}</span>
+                          </span>
+                          <span className="text-2xs font-extrabold text-slate-300 font-mono mt-0.5 block">
+                            Automatic loop: <span className="text-emerald-400">ACTIVE (10s sync)</span>
+                          </span>
+                        </div>
+
                         <button
                           id="test-telegram-btn"
                           disabled={isTelegramLoading}
                           onClick={sendManualTelegramTestAlert}
-                          className={`w-full md:w-auto px-5 py-3 bg-sky-650 hover:bg-sky-600 border border-sky-500/30 text-white font-extrabold text-xs uppercase tracking-widest rounded-xl transition-all flex items-center justify-center gap-2 shadow-[0_0_15px_rgba(14,165,233,0.15)] ${isTelegramLoading ? 'opacity-60 cursor-not-allowed select-none' : 'active:scale-95 cursor-pointer'}`}
+                          className={`w-full md:w-auto px-5 py-3 bg-gradient-to-r from-sky-600 to-blue-600 hover:from-sky-500 hover:to-blue-500 text-white font-extrabold text-xs uppercase tracking-widest rounded-xl transition-all flex items-center justify-center gap-2 shadow-[0_4px_12px_rgba(14,165,233,0.2)] ${isTelegramLoading ? 'opacity-60 cursor-not-allowed select-none' : 'active:scale-95 cursor-pointer'}`}
                         >
                           {isTelegramLoading ? (
                             <>
