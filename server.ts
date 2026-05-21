@@ -14,18 +14,8 @@ const PORT = 3000;
 app.use(express.json());
 
 // Dynamic URL detector for Telegram callback buttons
-let appBaseUrl = process.env.APP_URL || "";
-if (appBaseUrl && appBaseUrl.endsWith("/")) {
-  appBaseUrl = appBaseUrl.slice(0, -1);
-}
+let appBaseUrl = "https://royroutinerulees.netlify.app";
 app.use((req, res, next) => {
-  if (!appBaseUrl || appBaseUrl.includes("MY_APP_URL")) {
-    const protocol = req.headers["x-forwarded-proto"] === "https" || req.secure ? "https" : "http";
-    const host = req.headers.host;
-    if (host) {
-      appBaseUrl = `${protocol}://${host}`;
-    }
-  }
   next();
 });
 
