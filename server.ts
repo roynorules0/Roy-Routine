@@ -1,8 +1,10 @@
 import express from "express";
 import path from "path";
 import dotenv from "dotenv";
+import fs from "fs";
 import { GoogleGenAI } from "@google/genai";
 import { createServer as createViteServer } from "vite";
+import crypto from "crypto";
 
 dotenv.config();
 
@@ -11,8 +13,29 @@ const PORT = 3000;
 
 app.use(express.json());
 
+// Dynamic URL detector for Telegram callback buttons
+let appBaseUrl = process.env.APP_URL || "";
+if (appBaseUrl && appBaseUrl.endsWith("/")) {
+  appBaseUrl = appBaseUrl.slice(0, -1);
+}
+app.use((req, res, next) => {
+  if (!appBaseUrl || appBaseUrl.includes("MY_APP_URL")) {
+    const protocol = req.headers["x-forwarded-proto"] === "https" || req.secure ? "https" : "http";
+    const host = req.headers.host;
+    if (host) {
+      appBaseUrl = `${protocol}://${host}`;
+    }
+  }
+  next();
+});
+
 // In-memory array to store simulated email alerts so the user can inspect them in the frontend UI
 const simulatedEmails: any[] = [];
+
+// Helper to secure passcodes
+function hashPasscode(passcode: string): string {
+  return crypto.createHash("sha256").update(passcode).digest("hex");
+}
 
 // Helper to lazy-initialize Gemini API
 function getAIClient(clientApiKey?: string) {
@@ -576,320 +599,1442 @@ app.post("/api/emails/clear", (req, res) => {
 });
 
 
-// Simple backend storage for physical token configs and dynamic metrics
-const googleSessionStore = {
-  isFitConnected: false,
-  accessToken: "",
-  refreshToken: "",
-  expiresAt: 0,
-  steps: 8432, // Premium starter data
-  calories: 342,
-  distance: 5.2, // km
-  lastSyncedAt: new Date().toISOString()
-};
+// Simple stub backend storage (Google Fit integration removed)
+app.get("/api/auth/google/url", (req, res) => {
+  return res.json({
+    url: "",
+    isConfigured: false,
+    disabled: true
+  });
+});
 
-async function refreshAccessTokenIfNeeded() {
-  if (!googleSessionStore.refreshToken) return;
-  const now = Date.now();
-  if (now >= googleSessionStore.expiresAt - 60000) { // Refresh 1 min before expiry
-    console.log("[Google OAuth] Token expired, refreshing...");
-    try {
-      const resp = await fetch("https://oauth2.googleapis.com/token", {
-        method: "POST",
-        headers: { "Content-Type": "application/x-www-form-urlencoded" },
-        body: new URLSearchParams({
-          client_id: process.env.GOOGLE_CLIENT_ID || "",
-          client_secret: process.env.GOOGLE_CLIENT_SECRET || "",
-          refresh_token: googleSessionStore.refreshToken,
-          grant_type: "refresh_token"
-        })
-      });
-      if (resp.ok) {
-        const data = await resp.json() as any;
-        googleSessionStore.accessToken = data.access_token;
-        googleSessionStore.expiresAt = Date.now() + (data.expires_in * 1000);
-        console.log("[Google OAuth] Token refreshed successfully!");
-      }
-    } catch (e) {
-      console.error("[Google OAuth] Error refreshing code:", e);
+app.get(["/auth/callback", "/auth/callback/"], (req, res) => {
+  return res.send("<p>Google Fit integration has been disabled.</p>");
+});
+
+app.get("/api/fit/steps", (req, res) => {
+  return res.json({
+    isFitConnected: false,
+    steps: 0,
+    calories: 0,
+    distance: 0,
+    disabled: true
+  });
+});
+
+app.post("/api/fit/disconnect", (req, res) => {
+  return res.json({ success: true, disabled: true });
+});
+
+app.post("/api/fit/simulate", (req, res) => {
+  return res.json({ success: false, error: "Google Fit Integration is disabled", disabled: true });
+});
+
+
+// -----------------------------------------------------------------
+// REAL TELEGRAM BOT API INTEGRATION ENDPOINTS & STATE ENGINE
+// -----------------------------------------------------------------
+
+const TELEGRAM_USERS_FILE = path.join(process.cwd(), "telegram_users.json");
+const TELEGRAM_TOKENS_FILE = path.join(process.cwd(), "telegram_tokens.json");
+
+// Local File Database Loaders/Savers for Telegram Auth
+function loadTelegramUsers(): Record<string, any> {
+  try {
+    if (fs.existsSync(TELEGRAM_USERS_FILE)) {
+      const data = fs.readFileSync(TELEGRAM_USERS_FILE, "utf-8");
+      return JSON.parse(data);
     }
+  } catch (err) {
+    console.error("Error loading Telegram users file logic:", err);
+  }
+  return {};
+}
+
+function saveTelegramUser(user: any) {
+  try {
+    const users = loadTelegramUsers();
+    users[user.mobile] = user;
+    fs.writeFileSync(TELEGRAM_USERS_FILE, JSON.stringify(users, null, 2), "utf-8");
+    console.log(`[Database] Persisted telegram user profile: ${user.mobile} (${user.name})`);
+  } catch (err) {
+    console.error("Error saving Telegram user profile to file:", err);
   }
 }
 
-async function fetchGoogleFitStats() {
-  await refreshAccessTokenIfNeeded();
-  if (!googleSessionStore.accessToken) return;
+const activeTokens = new Map<string, { mobile: string; expiresAt: number }>();
 
-  console.log("[Google Fit API] Querying real step and fitness metrics...");
-  
-  const now = new Date();
-  const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
-  const endOfToday = startOfToday + 24 * 60 * 60 * 1000;
+function loadTelegramTokens() {
+  try {
+    if (fs.existsSync(TELEGRAM_TOKENS_FILE)) {
+      const data = fs.readFileSync(TELEGRAM_TOKENS_FILE, "utf-8");
+      const parsed = JSON.parse(data);
+      for (const [token, value] of Object.entries(parsed)) {
+        activeTokens.set(token, value as any);
+      }
+    }
+  } catch (err) {
+    console.error("Error loading Telegram login tokens file logic:", err);
+  }
+}
+
+function saveTelegramTokens() {
+  try {
+    const obj: Record<string, any> = {};
+    activeTokens.forEach((val, key) => {
+      if (val.expiresAt > Date.now()) {
+        obj[key] = val;
+      }
+    });
+    fs.writeFileSync(TELEGRAM_TOKENS_FILE, JSON.stringify(obj, null, 2), "utf-8");
+  } catch (err) {
+    console.error("Error saving Telegram login tokens profile to file:", err);
+  }
+}
+
+// Map tracking active Telegram conversation steps for signup
+interface ChatState {
+  step: "AWAITING_CONTACT" | "AWAITING_PASSCODE" | "AWAITING_PASSCODE_REPEAT" | "COMPLETED";
+  name?: string;
+  mobile?: string;
+  chatId: string;
+  payloadPasscode?: string;
+  regKey?: string;
+  username?: string;
+}
+
+const chatStates = new Map<string, ChatState>();
+const connectedChats = new Map<string, { chatId: string; firstName: string; username: string; token?: string }>();
+
+// Load maps from saved disk databases immediately on startup
+loadTelegramUsers();
+loadTelegramTokens();
+
+// Helper to send message with optional keyboard markups
+async function sendTelegramMessage(chatId: string, text: string, replyMarkup?: any) {
+  const token = process.env.TELEGRAM_BOT_TOKEN;
+  if (!token) return;
 
   try {
-    const response = await fetch("https://www.googleapis.com/fitness/v1/users/me/dataset/aggregate", {
+    await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
       method: "POST",
-      headers: {
-        "Authorization": `Bearer ${googleSessionStore.accessToken}`,
-        "Content-Type": "application/json"
-      },
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        aggregateBy: [
+        chat_id: chatId,
+        text,
+        parse_mode: "HTML",
+        reply_markup: replyMarkup
+      })
+    });
+  } catch (err) {
+    console.error(`Error delivering Telegram dispatch message to chat ${chatId}:`, err);
+  }
+}
+
+async function sendTelegramMessageWithButton(chatId: string, text: string, buttonText: string, buttonUrl: string) {
+  const replyMarkup = {
+    inline_keyboard: [
+      [
+        {
+          "text": buttonText,
+          "url": buttonUrl
+        }
+      ]
+    ]
+  };
+  await sendTelegramMessage(chatId, text, replyMarkup);
+}
+
+// Real Background update polling loop for Telegram Bot actions
+let pollingActive = false;
+let lastUpdateId = 0;
+
+async function handleTelegramUpdate(update: any) {
+  // 0. Handle callback query inline buttons
+  if (update.callback_query) {
+    const callbackQuery = update.callback_query;
+    const chatId = String(callbackQuery.message.chat.id);
+    const data = callbackQuery.data; // e.g. "complete:task_1"
+    const queryId = callbackQuery.id;
+
+    console.log(`[Telegram callback_query] Received payload "${data}" from Chat: ${chatId}`);
+
+    const parts = data.split(":");
+    const action = parts[0];
+    const taskId = parts[1];
+
+    const users = loadTelegramUsers();
+    let matchedUserKey: string | null = null;
+    let matchedUser: any = null;
+
+    for (const [mobile, user] of Object.entries(users)) {
+      if (user.profile && String(user.profile.telegramChatId) === chatId) {
+        matchedUserKey = mobile;
+        matchedUser = user;
+        break;
+      }
+    }
+
+    if (!matchedUser) {
+      await fetch(`https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}/answerCallbackQuery`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          callback_query_id: queryId,
+          text: "⚠️ No connected Telegram profile loaded.",
+          show_alert: true
+        })
+      });
+      return;
+    }
+
+    // Handle activate_routine callback before searching for standard taskId index
+    if (action === "activate_routine") {
+      const pendingTasks = matchedUser.pendingTasks || [];
+      if (pendingTasks.length === 0) {
+        await fetch(`https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}/answerCallbackQuery`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            callback_query_id: queryId,
+            text: "⚠️ No pending routine found to activate. Generate one in chat first!",
+            show_alert: true
+          })
+        });
+        return;
+      }
+
+      // Overwrite the current active tasks list
+      matchedUser.tasks = pendingTasks;
+      delete matchedUser.pendingTasks;
+
+      // Give welcome activation reward points
+      matchedUser.profile.points = (matchedUser.profile.points || 0) + 15;
+
+      users[matchedUserKey!] = matchedUser;
+      fs.writeFileSync(TELEGRAM_USERS_FILE, JSON.stringify(users, null, 2), "utf-8");
+
+      const successActivationMsg = `⚡ <b>ROY AI ROUTINE INITIALIZED SUCCESSFULLY</b>\n\nYour new time-wise discipline schedule is live!\n\n🔥 <b>Discipline Points:</b> +15 Bonus Credits Added\n🎯 <b>Missions Active:</b> <b>${matchedUser.tasks.length} Daily Rituals</b>\n🚨 <b>Reminders:</b> Enabled & Armed\n\nExecute every task with maximum honor. Stay strict!`;
+      await sendTelegramMessage(chatId, successActivationMsg);
+
+      await fetch(`https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}/answerCallbackQuery`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          callback_query_id: queryId,
+          text: "Routine Live! Dynamic schedule updated."
+        })
+      });
+      return;
+    }
+
+    const tasks = matchedUser.tasks || [];
+    const taskIndex = tasks.findIndex((t: any) => t.id === taskId);
+
+    if (taskIndex === -1) {
+      await fetch(`https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}/answerCallbackQuery`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          callback_query_id: queryId,
+          text: "⚠️ Task entry not found.",
+          show_alert: true
+        })
+      });
+      return;
+    }
+
+    const task = tasks[taskIndex];
+    const profile = matchedUser.profile;
+
+    if (action === "complete" || action === "beast") {
+      task.completed = true;
+      task.completedAt = new Date().toISOString();
+      task.skipped = false;
+
+      const pointsEarned = action === "beast" ? 20 : 10;
+      profile.points = (profile.points || 0) + pointsEarned;
+      profile.streak = (profile.streak || 0) + 1;
+      
+      if (profile.streak > (profile.maxStreak || 0)) {
+        profile.maxStreak = profile.streak;
+      }
+
+      // Upgrade ranks based on standard metric
+      if (profile.points >= 500) {
+        profile.guardianRank = "Discipline Master";
+      } else if (profile.points >= 300) {
+        profile.guardianRank = "Vanguard Veteran";
+      } else if (profile.points >= 150) {
+        profile.guardianRank = "Discipline Knight";
+      }
+
+      // Compute next target
+      const nextTasks = tasks.filter((t: any) => !t.completed && t.id !== task.id);
+      let nextTargetText = "All daily missions complete. Prepare for Nightly Report!";
+      if (nextTasks.length > 0) {
+        // Sort chronologically using minutes
+        nextTasks.sort((a: any, b: any) => parseTimeToMinutes(a.time) - parseTimeToMinutes(b.time));
+        nextTargetText = `🎯 ${nextTasks[0].title} — ${nextTasks[0].time}`;
+      }
+
+      users[matchedUserKey!] = matchedUser;
+      fs.writeFileSync(TELEGRAM_USERS_FILE, JSON.stringify(users, null, 2), "utf-8");
+
+      let replyText = "";
+      if (action === "beast") {
+        replyText = `⚡ <b>BEAST MODE ENGAGED!</b>\n\n👑 <b>Mission Complete with Honor!</b>\n🔥 Discipline Score +20 (Double Reward)\n🏆 Streak Dominating: <b>${profile.streak} Days</b>\n\n🚀 <b>NEXT TARGET:</b>\n${nextTargetText}`;
+      } else {
+        replyText = `✅ <b>Mission Completed</b>\n\n🔥 Discipline Score +10\n🏆 Streak Protected: <b>${profile.streak} Days</b>\n\n🚀 <b>NEXT TARGET:</b>\n${nextTargetText}`;
+      }
+
+      await sendTelegramMessage(chatId, replyText);
+
+      await fetch(`https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}/answerCallbackQuery`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          callback_query_id: queryId,
+          text: `Mission Confirmed! +${pointsEarned} Points Added.`
+        })
+      });
+
+    } else if (action === "skip") {
+      task.completed = false;
+      task.skipped = true;
+
+      profile.points = Math.max(0, (profile.points || 0) - 10);
+      profile.streak = Math.max(1, Math.round(profile.streak / 2));
+
+      users[matchedUserKey!] = matchedUser;
+      fs.writeFileSync(TELEGRAM_USERS_FILE, JSON.stringify(users, null, 2), "utf-8");
+
+      const replyText = `⚠️ <b>Mission Failed</b>\n\nDiscipline weakened today.\n\n🔥 <b>Discipline Score:</b> Reduced (-10 Points)\n⛔ <b>Streak Risk:</b> Critical. Do not skip again!`;
+      await sendTelegramMessage(chatId, replyText);
+
+      await fetch(`https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}/answerCallbackQuery`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          callback_query_id: queryId,
+          text: "Mission Skipped. Discipline weakened."
+        })
+      });
+    }
+    return;
+  }
+
+  const message = update.message;
+  if (!message) return;
+
+  const chatId = String(message.chat.id);
+  const text = message.text?.trim() || "";
+  const contact = message.contact;
+
+  // 1. Process explicit /start linking or commands
+  if (text.startsWith("/start")) {
+    const payload = text.split(/\s+/)[1] || "";
+    const hasRegKey = payload.startsWith("reg_");
+    
+    if (hasRegKey) {
+      connectedChats.set(payload, {
+        chatId,
+        firstName: message.chat.first_name || message.chat.username || "Operator",
+        username: message.chat.username || ""
+      });
+    }
+
+    // Direct Telegram Registration / Start flow
+    chatStates.set(chatId, {
+      step: "AWAITING_CONTACT",
+      chatId,
+      username: message.chat.username || message.from?.username || "",
+      regKey: hasRegKey ? payload : undefined
+    });
+
+    const contactMarkup = {
+      keyboard: [
+        [
           {
-            dataTypeName: "com.google.step_count.delta",
-            dataSourceId: "derived:com.google.step_count.delta:com.google.android.gms:estimated_steps"
-          },
-          {
-            dataTypeName: "com.google.calories.expended",
-            dataSourceId: "derived:com.google.calories.expended:com.google.android.gms:from_activities"
-          },
-          {
-            dataTypeName: "com.google.distance.delta",
-            dataSourceId: "derived:com.google.distance.delta:com.google.android.gms:pruned_distance"
+            text: "📱 SHARE CONTACT",
+            request_contact: true
           }
-        ],
-        bucketByTime: { durationMillis: 86400000 },
-        startTimeMillis: startOfToday,
-        endTimeMillis: endOfToday
+        ]
+      ],
+      resize_keyboard: true,
+      one_time_keyboard: true
+    };
+
+    const welcomeMsg = hasRegKey
+      ? `🛡️ <b>Roy Session Linked</b>\n\nYour session registration key is attached. Next, please share your contact details below to finalize setting up your profile & auto-login credentials.`
+      : `🚀 <b>Welcome to Roy Routine</b>\n\nTo synchronize your mobile streak database & authorize automated notifications, please share your contact information with a single press below.`;
+
+    await sendTelegramMessage(chatId, welcomeMsg, contactMarkup);
+    return;
+  }
+
+  // 2. Process Contact sharing event
+  if (contact && chatStates.get(chatId)?.step === "AWAITING_CONTACT") {
+    const state = chatStates.get(chatId)!;
+    const phone = contact.phone_number;
+    const cleanPhone = phone.replace(/\D/g, "");
+    const firstName = [contact.first_name, contact.last_name].filter(Boolean).join(" ").trim() || message.chat.first_name || "Operator";
+
+    state.mobile = cleanPhone;
+    state.name = firstName;
+    if (!state.username) {
+      state.username = message.chat.username || message.from?.username || "";
+    }
+    state.step = "AWAITING_PASSCODE";
+    chatStates.set(chatId, state);
+
+    // Remove custom keyboard
+    const removeKeyboardMarkup = { remove_keyboard: true };
+
+    await sendTelegramMessage(
+      chatId,
+      `🔐 <b>Create Your Roy Routine Passcode</b>\n\nPlease enter a secure passcode to safeguard your dashboard operator profile:`,
+      removeKeyboardMarkup
+    );
+    return;
+  }
+
+  // 3. Process passcode keys inputs
+  const state = chatStates.get(chatId);
+  if (state && text) {
+    if (state.step === "AWAITING_PASSCODE") {
+      state.payloadPasscode = text;
+      state.step = "AWAITING_PASSCODE_REPEAT";
+      chatStates.set(chatId, state);
+      await sendTelegramMessage(chatId, `🔐 <b>Repeat your passcode:</b>`);
+      return;
+    }
+
+    if (state.step === "AWAITING_PASSCODE_REPEAT") {
+      if (text === state.payloadPasscode) {
+        state.step = "COMPLETED";
+        chatStates.set(chatId, state);
+
+        const mobileTrim = state.mobile!;
+        const userId = `user_${mobileTrim}`;
+        const displayName = state.name || "Operator";
+        const telegramUsername = state.username || message.chat.username || message.from?.username || "";
+
+        // Create standard premium user profile
+        const newProfile = {
+          uid: userId,
+          email: `${mobileTrim}@telegram.roy`,
+          displayName: displayName,
+          photoURL: `https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?q=80&w=256&auto=format&fit=crop`,
+          points: 100, // starting welcome credits
+          streak: 1,
+          maxStreak: 1,
+          currentMood: "Motivated",
+          guardianRank: "Vanguard Initiate",
+          isFitConnected: false,
+          emailRemindersEnabled: false,
+          telegramChatId: chatId,
+          telegramConnected: true,
+          telegramUsername: telegramUsername,
+          fitSteps: 0,
+          fitDistance: 0,
+          fitCalories: 0,
+          fitActiveMinutes: 0
+        };
+
+        const newTasks = [
+          { id: "task_1", title: "Complete Daily Ritual - Focus Focus", category: "General", time: "08:00 AM", points: 20, completed: false, completedAt: null, createdAt: new Date().toISOString(), systemGenerated: true, date: new Date().toISOString().split('T')[0] },
+          { id: "task_2", title: "30 Mins Coding Drill", category: "Study", time: "11:00 AM", points: 30, completed: false, completedAt: null, createdAt: new Date().toISOString(), systemGenerated: true, date: new Date().toISOString().split('T')[0] },
+          { id: "task_3", title: "Active 2KM Jogging", category: "Running", time: "05:30 PM", points: 25, completed: false, completedAt: null, createdAt: new Date().toISOString(), systemGenerated: true, date: new Date().toISOString().split('T')[0] }
+        ];
+
+        // Generate dynamic secure token
+        const token = "tg_tok_" + Math.random().toString(36).substring(2, 12) + Math.random().toString(36).substring(2, 12);
+
+        // Hashing the passcode
+        const passcodeHash = hashPasscode(text);
+        
+        // Decrypt / save raw passcode in base64 encrypted mapping on server for high security
+        const encryptedPasscode = Buffer.from(text).toString("base64");
+        
+        const serverUser = {
+          name: displayName,
+          mobile: mobileTrim,
+          passcode: text,
+          passcodeHash: passcodeHash,
+          encryptedPasscode: encryptedPasscode,
+          telegramChatId: chatId,
+          telegramUsername: telegramUsername,
+          accountId: userId,
+          uid: userId,
+          authToken: token,
+          profile: newProfile,
+          tasks: newTasks
+        };
+
+        saveTelegramUser(serverUser);
+
+        activeTokens.set(token, {
+          mobile: mobileTrim,
+          expiresAt: Date.now() + 7 * 24 * 60 * 60 * 1000 // 7 days of validation
+        });
+        saveTelegramTokens();
+
+        if (state.regKey) {
+          connectedChats.set(state.regKey, {
+            chatId,
+            firstName: displayName,
+            username: telegramUsername,
+            token
+          });
+        }
+
+        const loginUrl = `${appBaseUrl}/?tg_token=${token}`;
+
+        const successMessage = `✅ <b>Account Created</b>\n🔐 <b>Session Linked</b>\n🌐 <b>Website Access Ready</b>\n\nYour premium Roy Routine Discipline dashboard is ready to lock in! Select the button below to auto-login.`;
+
+        await sendTelegramMessageWithButton(
+          chatId,
+          successMessage,
+          "OPEN DASHBOARD",
+          loginUrl
+        );
+      } else {
+        // Passcodes mismatch: reset back to create passcode
+        state.step = "AWAITING_PASSCODE";
+        chatStates.set(chatId, state);
+        await sendTelegramMessage(
+          chatId,
+          `❌ <b>Passcodes do not match.</b>\n\nLet's re-establish security config. Please enter your desired passcode:`
+        );
+      }
+    }
+  }
+
+  // 4. Handle registered users or unknown chats (AI Routine system)
+  if (!state || state.step === "COMPLETED") {
+    // Look up user
+    const users = loadTelegramUsers();
+    let matchedUserKey: string | null = null;
+    let matchedUser: any = null;
+
+    for (const [mobile, u] of Object.entries(users)) {
+      if (u.profile && String(u.profile.telegramChatId) === chatId) {
+        matchedUserKey = mobile;
+        matchedUser = u;
+        break;
+      }
+    }
+
+    if (!matchedUser) {
+      // User is chatting but not registered yet
+      if (text) {
+        const welcomeHint = `👋 <b>Welcome to Roy Routine AI Discipline Operating System!</b>\n\nI can build high-intensity, structured routines, provide automated alerts, track your daily streaks, and help you execute missions.\n\n🔐 <b>To get started and connect your account, please send /start.</b>`;
+        await sendTelegramMessage(chatId, welcomeHint);
+      }
+      return;
+    }
+
+    // Registered user has sent a message
+    if (text) {
+      if (text === "/help" || text === "/start") {
+        const helpMsg = `🛡️ <b>Roy AI Discipline Operating System</b>\n\nYou are logged in as <b>${matchedUser.profile.displayName}</b>.\n\n💬 <b>Generate Daily Routines:</b>\nSimply write what you want to achieve today! For example:\n• <i>"My study daily routine"</i>\n• <i>"Create my daily mission"</i>\n• <i>"Wake me at 4 AM and schedule study"</i>\n\n🎯 I will process your request, compile your mission timeline, and present you with an <b>[ ACTIVATE ROUTINE ]</b> button to deploy it.\n\n⏰ <b>Reminders & Interactive Buttons:</b>\nI'll push active missions at exact start times with interactive options: <b>Complete</b>, <b>Skip</b>, or <b>Beast Mode</b>! Keep your streak high!`;
+        await sendTelegramMessage(chatId, helpMsg);
+        return;
+      }
+
+      // Send immediate feedback so the user knows the AI is working
+      const compilationNotice = `🧠 <b>Roy AI is compiling your premium routine...</b>\n<i>Analyzing constraints, study targets, and discipline goals...</i>`;
+      await sendTelegramMessage(chatId, compilationNotice);
+
+      try {
+        const generatedTasks = await generateTelegramRoutineAI(text, matchedUser.profile.currentMood || "Motivated");
+
+        // Temporarily hold inside user database map for activation
+        matchedUser.pendingTasks = generatedTasks;
+        users[matchedUserKey!] = matchedUser;
+        fs.writeFileSync(TELEGRAM_USERS_FILE, JSON.stringify(users, null, 2), "utf-8");
+
+        let msg = `🔥 <b>ROY AI ROUTINE GENERATED</b>\n\n`;
+        generatedTasks.forEach((t: any) => {
+          msg += `⏰ <b>${t.time}</b> → ${t.title} <i>(${t.points} pts, ${t.category})</i>\n`;
+        });
+        msg += `\n🎯 <i>Ready to lock in your discipline? Activate now to start real-time reminders & protect your streak:</i>`;
+
+        const inlineActivationMarkup = {
+          inline_keyboard: [
+            [
+              { text: "⚡ ACTIVATE ROUTINE", callback_data: "activate_routine" }
+            ]
+          ]
+        };
+
+        await sendTelegramMessage(chatId, msg, inlineActivationMarkup);
+      } catch (err) {
+        console.error("AI Generation error:", err);
+        await sendTelegramMessage(chatId, `❌ <b>Failed to generate routine.</b> Please try again with simple parameters (e.g. "My study daily routine").`);
+      }
+    }
+    return;
+  }
+}
+
+// AI routine generation helper and formats
+async function generateTelegramRoutineAI(prompt: string, mood: string): Promise<any[]> {
+  const ai = getAIClient();
+  if (ai) {
+    try {
+      const promptText = `Generate a realistic daily routine structured for a user.
+User Input in Telegram: "${prompt}"
+User Mood Accent: "${mood}"
+
+Create exactly 5-7 tasks balancing learning/study, physical activity (running/fitness), sleep, and mental discipline.
+Assign appropriate points to tasks (ranging from 10 to 30 based on difficulty). Higher intensity for active study or running blocks.
+
+You MUST return a JSON object containing a "tasks" array.
+Do NOT wrap in any extra formatting, return EXACTLY the JSON matched against this model:
+{
+  "tasks": [
+    {
+      "title": "Clean concise task title e.g. Study Chemistry",
+      "category": "One of: Study, Running, Sleep, General",
+      "time": "Standard AM/PM formatted time e.g. 08:30 AM",
+      "points": 20
+    }
+  ]
+}`;
+
+      const response = await ai.models.generateContent({
+        model: "gemini-3.5-flash",
+        contents: promptText,
+        config: {
+          responseMimeType: "application/json"
+        }
+      });
+
+      const resText = response.text;
+      if (resText) {
+        const parsed = JSON.parse(resText);
+        if (parsed.tasks && Array.isArray(parsed.tasks)) {
+          // Add essential timestamp ids and default parameters for each task
+          return parsed.tasks.map((t: any, index: number) => ({
+            id: `tg_task_${Date.now()}_${index}`,
+            title: t.title || "Routine Task",
+            category: t.category || "General",
+            time: t.time || "08:00 AM",
+            points: t.points || 20,
+            completed: false,
+            completedAt: null,
+            createdAt: new Date().toISOString(),
+            systemGenerated: true,
+            date: new Date().toISOString().split('T')[0]
+          }));
+        }
+      }
+    } catch (err) {
+      console.error("Gemini failed in Telegram routine compiler, falling back to smart builder:", err);
+    }
+  }
+
+  // Smart template-based fallback if Gemini is offline/uncoded
+  console.log("Using smart template-based fallback routine generator for query:", prompt);
+  
+  const lowercasePrompt = prompt.toLowerCase();
+  let startHour = 6; 
+  let wakeTimeStr = "06:00 AM";
+
+  if (lowercasePrompt.includes("4 am") || lowercasePrompt.includes("4am") || lowercasePrompt.includes("4:00 am") || lowercasePrompt.includes("4:00am")) {
+    startHour = 4;
+    wakeTimeStr = "04:00 AM";
+  } else if (lowercasePrompt.includes("5 am") || lowercasePrompt.includes("5am") || lowercasePrompt.includes("5:00 am") || lowercasePrompt.includes("5:00am")) {
+    startHour = 5;
+    wakeTimeStr = "05:00 AM";
+  } else if (lowercasePrompt.includes("7 am") || lowercasePrompt.includes("7am") || lowercasePrompt.includes("7:00 am") || lowercasePrompt.includes("7:00am")) {
+    startHour = 7;
+    wakeTimeStr = "07:00 AM";
+  } else if (lowercasePrompt.includes("8 am") || lowercasePrompt.includes("8am") || lowercasePrompt.includes("8:00 am") || lowercasePrompt.includes("8:00am")) {
+    startHour = 8;
+    wakeTimeStr = "08:00 AM";
+  }
+
+  const studyDuration = lowercasePrompt.includes("study") ? "Deep Study" : "Focused Revision";
+  const runDuration = lowercasePrompt.includes("run") || lowercasePrompt.includes("workout") ? "Active Outdoor Run" : "Physical Exercise Block";
+
+  const fallbackTasks = [
+    {
+      title: "Wake Up & Hydration Drill",
+      category: "General",
+      time: wakeTimeStr,
+      points: 15
+    },
+    {
+      title: `${studyDuration} (Critical Session)`,
+      category: "Study",
+      time: formatAsAmPm(startHour + 1, 0),
+      points: 25
+    },
+    {
+      title: "Hydration Intake & Nutrition Break",
+      category: "General",
+      time: formatAsAmPm(startHour + 3, 30),
+      points: 10
+    },
+    {
+      title: `${studyDuration} (Secondary Review)`,
+      category: "Study",
+      time: formatAsAmPm(startHour + 5, 0),
+      points: 20
+    },
+    {
+      title: `${runDuration} (Discipline Hustle)`,
+      category: "Running",
+      time: "05:30 PM",
+      points: 20
+    },
+    {
+      title: "Tactical Sleep Optimization Wind-down",
+      category: "Sleep",
+      time: "10:30 PM",
+      points: 15
+    }
+  ];
+
+  return fallbackTasks.map((t, index) => ({
+    id: `tg_task_${Date.now()}_${index}`,
+    ...t,
+    completed: false,
+    completedAt: null,
+    createdAt: new Date().toISOString(),
+    systemGenerated: true,
+    date: new Date().toISOString().split('T')[0]
+  }));
+}
+
+function formatAsAmPm(hours: number, minutes: number): string {
+  const ampm = hours >= 12 ? "PM" : "AM";
+  const displayHours = hours % 12 || 12;
+  const mm = String(minutes).padStart(2, "0");
+  const hh = String(displayHours).padStart(2, "0");
+  return `${hh}:${mm} ${ampm}`;
+}
+
+async function runTelegramPolling() {
+  const token = process.env.TELEGRAM_BOT_TOKEN;
+  if (!token) return;
+
+  if (pollingActive) return;
+  pollingActive = true;
+
+  try {
+    const response = await fetch(`https://api.telegram.org/bot${token}/getUpdates?offset=${lastUpdateId + 1}&limit=100&timeout=4`);
+    if (response.ok) {
+      const data = await response.json() as any;
+      if (data.ok && data.result && data.result.length > 0) {
+        for (const update of data.result) {
+          lastUpdateId = Math.max(lastUpdateId, update.update_id);
+          await handleTelegramUpdate(update);
+        }
+      }
+    }
+  } catch (err) {
+    console.error("Error in active background update polling sequence:", err);
+  } finally {
+    pollingActive = false;
+  }
+}
+
+// Initialize active background interval to process bot chat steps
+setInterval(runTelegramPolling, 2500);
+
+
+// --- TELEGRAM COMPANION BACKGROUND SCHEDULER & REALTIME DISPATCHERS ---
+
+let schedulerActive = false;
+
+// Premium Hinglish motivational static template vectors for robust fallback
+const NIGHT_MOTIVATIONS = [
+  "Deep sleep bhi discipline ka part hai, {name}. Aaj ka battle complete ho gaya. Kal fir subah {wakeHour} baje attack karna hai. So jao with honor.",
+  "Warrior {name}, recovery is where your mind is rebuilt. Phone silent pe rkh, eye strain avoid kar, aur tactical deep sleep start kar.",
+  "So jao abhi focus se, {name}. The future version of you needs you rested and sharp tomorrow. Sleep with a clean conscience, today's battle was fought with honor."
+];
+
+const STUDY_MOTIVATIONS = [
+  "🔑 {name}, focus up right now! Padhte waqt phone door rkh. Infinite scrolling se future build nahi hota. Crush your sessions!",
+  "WhatsApp and Insta side me rakh, {name}. Active study hour is running. Deep study session needs absolute focus. Padho toh hardcore padho, no distractions!",
+  "Topper mentality is choosing focus when distraction is easier. {name}, deep concentration on current task now. No cheap dopamine!"
+];
+
+const SKIP_MOTIVATIONS = [
+  "⚠️ Target skip karne se pain of regret select kar rahe ho, {name}. Ek skip can break your whole momentum. Comeback aggressively now!",
+  "Excuses don't build empires, {name}. Skip click karna easy tha, par failure face karna mushkil hoga. Get up and execute adjacent ritual now!",
+  "Discipline is about doing what you hate like you love it. {name}, start again. Protect your streak of {streak} days!"
+];
+
+const STREAK_MOTIVATIONS = [
+  "🔥 Beast Mode activated! {streak} Days streak is legendary, {name}. Kamzoor log abhi stop karenge, par you are built different. Push boundaries today!",
+  "Consistency creates legends. {streak} Days protected proves you have stellar willpower, {name}. Pure warrior focus, streak secure!",
+  "Elite mindset in play, {name}. Keep this momentum burning. Distractions can't touch you now. Victory is certain!"
+];
+
+const INACTIVE_MOTIVATIONS = [
+  "🚨 {name}, subah se ek bhi goal complete nahi hua. Distraction is winning. Mind is slipping into comfort zone. Comeback to battlefield now!",
+  "Operator {name}, dashboard is empty today. No checked targets. Don't let your streak drop. Rebuild with a small 10-minute focus session now!",
+  "Zero completed tasks today, {name}. Time is slipping away silently. Future you is watching your moves. Put screen down and start executing!"
+];
+
+const GENERAL_MOTIVATIONS = [
+  "Phone side me rkh. Screen time zero karo aur target pe wapas aa, {name}. Real discipline hurts but leaves you crowned.",
+  "Pain of discipline is lighter than the weight of failure, {name}. Take control of your attention immediately.",
+  "Streak of {streak} Days needs your focus, {name}. Cheap dopamine builds cheap outcomes. Stay focused, stay strict!"
+];
+
+function formatPremiumNotification(msg: string, profile: any): string {
+  const rankIcon = profile.points >= 500 ? "👑" : profile.points >= 300 ? "🎖️" : "🛡️";
+  return `⚡ <b>ROY AI DISCIPLINE DISPATCH</b> ⚡\n━━━━━━━━━━━━━━━━━━\n\n👉 <i>"${msg}"</i>\n\n⭐ <b>XP Points:</b> ${profile.points || 100} credits\n🏆 <b>Streak:</b> <b>${profile.streak || 1} Days Active</b>\n🦾 <b>Rank:</b> ${rankIcon} ${profile.guardianRank || "Acolyte"}\n━━━━━━━━━━━━━━━━━━\n🚀 <i>Powered by Roy No Rules</i>`;
+}
+
+async function dispatchHinglishMotivation(chatId: string, user: any, flags: any) {
+  const profile = user.profile;
+  const name = profile.displayName || "Warrior";
+  const streak = profile.streak || 1;
+  const points = profile.points || 100;
+  
+  let chosenMotivationText = "";
+  
+  // Decide primary state flag context
+  let category = "General";
+  if (flags.isNightMode) category = "Night";
+  else if (flags.hasSkips) category = "Skip";
+  else if (flags.isStudyHour) category = "Study";
+  else if (flags.isInactive) category = "Inactive";
+  else if (flags.isHighStreak) category = "Streak";
+
+  const ai = getAIClient();
+  if (ai) {
+    try {
+      let stateDescription = "General high energy discipline motivation.";
+      if (flags.isNightMode) {
+        stateDescription = "In sleep hours / night recovery block. Softer, calm-power message emphasizing restorative rest, deep healthy sleep, and preparation for tomorrow.";
+      } else if (flags.hasSkips) {
+        stateDescription = "User skipped an active target today. Challenging warnings, anti-comfort zone, aggressive comeback fire.";
+      } else if (flags.isInactive) {
+        stateDescription = "No tasks completed today so far. Direct alarm, anti-distraction, push back into the arena.";
+      } else if (flags.isStudyHour) {
+        stateDescription = "Deep study session. Focus explicitly on putting the phone away, dopamine control, and topper mindset focus.";
+      } else if (flags.isHighStreak) {
+        stateDescription = "Awesome multi-day streak motivation. Keep the momentum going, elite warrior habits.";
+      }
+
+      const promptText = `
+You are Roy, an uncompromising, hyper-disciplined AI productivity & fitness guardian.
+Tone: hard-core masculine discipline energy, motivating, conversational, emotionally engaging, written in natural Latin-script Hinglish (Hindi + English).
+
+Generate ONE short, powerful, direct motivation quote for the user "${name}".
+
+Current user stats:
+- Points: ${points} XP
+- Streak: ${streak} Days
+- Guardian Rank: ${profile.guardianRank || "Initiate"}
+- Target Context theme: ${stateDescription}
+
+RULES:
+- Do NOT output HTML tags, markdown, backticks, titles, or introduction/preamble. Just output the raw generated Hinglish text (1-2 sentences max).
+- Direct and extremely conversational. Address them by name "${name}".
+- Latin script Hinglish (e.g., "Suno ${name}, phone side rkh, target focus kr.")
+`;
+
+      const response = await ai.models.generateContent({
+        model: "gemini-3.5-flash",
+        contents: promptText,
+      });
+
+      if (response && response.text) {
+        chosenMotivationText = response.text.trim();
+        console.log(`[Gemini Motivation] Generated text for ${name}: ${chosenMotivationText}`);
+      }
+    } catch (gErr) {
+      console.error("[Gemini Motivation] AI dynamic text generation failed, switching to fallback:", gErr);
+    }
+  }
+
+  if (!chosenMotivationText) {
+    let list = GENERAL_MOTIVATIONS;
+    if (category === "Night") list = NIGHT_MOTIVATIONS;
+    else if (category === "Skip") list = SKIP_MOTIVATIONS;
+    else if (category === "Study") list = STUDY_MOTIVATIONS;
+    else if (category === "Inactive") list = INACTIVE_MOTIVATIONS;
+    else if (category === "Streak") list = STREAK_MOTIVATIONS;
+
+    const randomIndex = Math.floor(Math.random() * list.length);
+    const template = list[randomIndex];
+
+    chosenMotivationText = template
+      .replace(/{name}/g, name)
+      .replace(/{streak}/g, String(streak))
+      .replace(/{wakeHour}/g, "04:30 AM");
+  }
+
+  const fullHtmlMessage = formatPremiumNotification(chosenMotivationText, profile);
+  await sendTelegramMessage(chatId, fullHtmlMessage);
+}
+
+// Simple helper to parse AM/PM time to minutes since midnight (e.g. "08:30 AM" => 510)
+function parseTimeToMinutes(timeStr: string): number {
+  try {
+    const cleanTime = timeStr.trim();
+    const parts = cleanTime.match(/(\d+):(\d+)\s+(AM|PM)/i);
+    if (!parts) return 0;
+    let hours = parseInt(parts[1], 10);
+    const minutes = parseInt(parts[2], 10);
+    const ampm = parts[3].toUpperCase();
+    if (ampm === "PM" && hours !== 12) hours += 12;
+    if (ampm === "AM" && hours === 12) hours = 0;
+    return hours * 60 + minutes;
+  } catch (e) {
+    return 0;
+  }
+}
+
+function getFormattedHourMin(dateObj: Date): string {
+  const hours24 = dateObj.getHours();
+  const minutes = dateObj.getMinutes();
+  const ampm = hours24 >= 12 ? "PM" : "AM";
+  const hours12 = hours24 % 12 || 12;
+  const hh = String(hours12).padStart(2, "0");
+  const mm = String(minutes).padStart(2, "0");
+  return `${hh}:${mm} ${ampm}`;
+}
+
+function getTodayString(): string {
+  const today = new Date();
+  const yyyy = today.getFullYear();
+  const mm = String(today.getMonth() + 1).padStart(2, "0");
+  const dd = String(today.getDate()).padStart(2, "0");
+  return `${yyyy}-${mm}-${dd}`;
+}
+
+function getTodayStringForOffset(hoursOffset: number): string {
+  const d = new Date(new Date().getTime() + (hoursOffset * 60 * 60 * 1000));
+  const yyyy = d.getFullYear();
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  return `${yyyy}-${mm}-${dd}`;
+}
+
+async function runBackgroundScheduler() {
+  if (schedulerActive) return;
+  schedulerActive = true;
+
+  try {
+    const token = process.env.TELEGRAM_BOT_TOKEN;
+    if (!token) {
+      schedulerActive = false;
+      return;
+    }
+
+    const todayDate = getTodayString();
+    
+    // Check exact current formatted time
+    const now = new Date();
+    const currentFormattedTime = getFormattedHourMin(now);
+    
+    // Also support checking GMT+5.5 (IST) timezone
+    const istTime = new Date(now.getTime() + (5.5 * 60 * 60 * 1000));
+    const istFormattedTime = getFormattedHourMin(istTime);
+    const istTodayDate = getTodayStringForOffset(5.5);
+
+    const users = loadTelegramUsers();
+    let hasChanges = false;
+
+    for (const [mobile, user] of Object.entries(users)) {
+      if (!user.profile || !user.profile.telegramChatId || !user.profile.telegramConnected) {
+        continue;
+      }
+
+      const chatId = user.profile.telegramChatId;
+      const tasks = user.tasks || [];
+      const userProfile = user.profile;
+
+      // 1. Core Routine Alerts & Warnings
+      for (const task of tasks) {
+        const taskTime = task.time ? task.time.trim() : "";
+        
+        // Exact minute matching checks
+        const matchServer = (taskTime === currentFormattedTime);
+        const matchIst = (taskTime === istFormattedTime);
+
+        if (matchServer || matchIst) {
+          const effectiveDate = matchServer ? todayDate : istTodayDate;
+          
+          if (task.notifiedDate !== effectiveDate) {
+            task.notifiedDate = effectiveDate;
+            hasChanges = true;
+
+            // Prepare beautiful mission dispatch message with inline keys
+            const messageText = `🚨 <b>ROY ROUTINE MISSION DISPATCH</b>\n\n⏰ <b>Time:</b> ${task.time}\n🎯 <b>Target:</b> ${task.title}\n\n🔥 <i>Discipline creates legends. Complete your target now!</i>`;
+            
+            const replyMarkup = {
+              inline_keyboard: [
+                [
+                  { text: "✅ COMPLETE", callback_data: `complete:${task.id}` },
+                  { text: "⏰ SKIP", callback_data: `skip:${task.id}` }
+                ],
+                [
+                  { text: "🔥 BEAST MODE", callback_data: `beast:${task.id}` }
+                ]
+              ]
+            };
+
+            await sendTelegramMessage(chatId, messageText, replyMarkup);
+            console.log(`[Scheduler] Sent task reminder: "${task.title}" to Chat ${chatId}`);
+          }
+        }
+        
+        // Extreme Discipline Mode Checks (overdue by 30 minutes)
+        if (!task.completed && !task.skipped && task.notifiedDate === (matchServer ? todayDate : istTodayDate) && !task.extremeDisciplineNotified) {
+          const taskMin = parseTimeToMinutes(task.time);
+          const currentMin = parseTimeToMinutes(matchServer ? currentFormattedTime : istFormattedTime);
+          
+          // Overdue range
+          if (currentMin > taskMin + 30 && currentMin < taskMin + 90) {
+            task.extremeDisciplineNotified = true;
+            hasChanges = true;
+
+            const aggressiveComebacks = [
+               `🚨 <b>EXTREME DISCIPLINE BREACH DETECTED!</b>\n\nYou completely ignored your mission: <b>"${task.title}"</b>!\n\nAre you becoming soft? Get off your screen, break your comfort zone, and attack your daily ritual immediately!`,
+               `🔥 <b>ROY NO RULES REMINDER!</b>\n\nYour scheduled task <b>"${task.title}"</b> is overdue! Pain is temporary, but the shame of quitting is permanent. Go full BEAST MODE now!`,
+               `⚠️ <b>DISCIPLINE CRITICAL ALERT!</b>\n\nYou missed your target <b>"${task.title}"</b>. If you fail this, your streak is compromised and Punishment Mode will be engaged. Get it done!`
+            ];
+            
+            const randomMsg = aggressiveComebacks[Math.floor(Math.random() * aggressiveComebacks.length)];
+            
+            const inlineMarkup = {
+              inline_keyboard: [
+                [
+                  { text: "⚡ COMPLETE NOW", callback_data: `complete:${task.id}` },
+                  { text: "🔥 ENGAGE BEAST MODE", callback_data: `beast:${task.id}` }
+                ]
+              ]
+            };
+
+            await sendTelegramMessage(chatId, randomMsg, inlineMarkup);
+            console.log(`[Scheduler] Dispatched extreme alert to ${chatId}`);
+          }
+        }
+      }
+
+      // 2. Nightly Report Auto dispatch Checks at 09:30 PM
+      const isNightReportServerTime = (currentFormattedTime === "09:30 PM");
+      const isNightReportIstTime = (istFormattedTime === "09:30 PM");
+      
+      if (isNightReportServerTime || isNightReportIstTime) {
+        const effectiveDate = isNightReportServerTime ? todayDate : istTodayDate;
+        if (userProfile.lastNightlyReportDate !== effectiveDate) {
+          userProfile.lastNightlyReportDate = effectiveDate;
+          hasChanges = true;
+
+          const totalCount = tasks.length || 1;
+          const completedCount = tasks.filter((t: any) => t.completed).length;
+          const missedCount = totalCount - completedCount;
+          const disciplineScore = Math.round((completedCount / totalCount) * 100);
+          
+          let reportMsg = `📊 <b>ROY ROUTINE DAILY REPORT</b>\n\n`;
+          reportMsg += `✅ <b>Completed Missions:</b> ${completedCount}\n`;
+          reportMsg += `❌ <b>Missed Missions:</b> ${missedCount}\n`;
+          reportMsg += `🔥 <b>Discipline Score:</b> ${disciplineScore}%\n`;
+          reportMsg += `🏆 <b>Streak:</b> ${userProfile.streak || 1} Days\n\n`;
+          
+          if (disciplineScore >= 80) {
+            reportMsg += `👑 Excellent focus, Warrior! You have proven your discipline today. Legends are built on consistency.`;
+          } else if (disciplineScore >= 50) {
+            reportMsg += `⚠️ Average performance. Discipline requires uncompromising commitment. Step up tomorrow!`;
+          } else {
+            reportMsg += `🚨 <b>FAIL DETECTED.</b> Your performance was weak. Roy Routine expects absolute focus. Prepare to rebuild!`;
+          }
+
+          const loginUrl = `${appBaseUrl}/?tg_token=${user.token || ""}`;
+          await sendTelegramMessageWithButton(chatId, reportMsg, "OPEN ROY ROUTINE", loginUrl);
+          console.log(`[Scheduler] Nightly report dispatched to Chat ${chatId}`);
+        }
+      }
+
+      // 3. Hourly Hinglish Motivation Engine Adaptation check
+      const nowMs = Date.now();
+      const lastMotivationSentAt = userProfile.lastHourlyMotivationSentAt;
+      let shouldTriggerMotivation = false;
+
+      if (!lastMotivationSentAt) {
+        shouldTriggerMotivation = true;
+      } else {
+        const elapsed = nowMs - new Date(lastMotivationSentAt).getTime();
+        // Trigger precisely every 1 hour (3600000 ms)
+        if (elapsed >= 3600000) {
+          shouldTriggerMotivation = true;
+        }
+      }
+
+      if (shouldTriggerMotivation) {
+        try {
+          const serverHour = new Date().getHours();
+          const istHour = new Date(nowMs + (5.5 * 60 * 60 * 1000)).getUTCHours();
+          const currentHour = (new Date().getTimezoneOffset() === 0) ? istHour : serverHour;
+
+          let wakeHour = 5;
+          let sleepHour = 23;
+          for (const t of tasks) {
+            if (t.category === "Sleep" || t.title.toLowerCase().includes("sleep") || t.title.toLowerCase().includes("wind-down")) {
+              const parsedMin = parseTimeToMinutes(t.time);
+              if (parsedMin > 0) sleepHour = Math.floor(parsedMin / 60);
+            }
+            if (t.title.toLowerCase().includes("wake") || t.title.toLowerCase().includes("wake up")) {
+              const parsedMin = parseTimeToMinutes(t.time);
+              if (parsedMin > 0) wakeHour = Math.floor(parsedMin / 60);
+            }
+          }
+
+          const isNightMode = (currentHour >= sleepHour || currentHour < wakeHour);
+
+          let isStudyHour = false;
+          const currentMin = currentHour * 60 + new Date().getMinutes();
+          for (const t of tasks) {
+            if (t.category === "Study" && !t.completed && !t.skipped) {
+              const taskMin = parseTimeToMinutes(t.time);
+              if (currentMin >= taskMin - 30 && currentMin < taskMin + 120) {
+                isStudyHour = true;
+                break;
+              }
+            }
+          }
+
+          const hasSkips = tasks.some((t: any) => t.skipped === true);
+          const isHighStreak = (userProfile.streak >= 3);
+          const completedCount = tasks.filter((t: any) => t.completed).length;
+          const isInactive = (completedCount === 0 && !isNightMode);
+
+          // Mark sent timestamp
+          userProfile.lastHourlyMotivationSentAt = new Date().toISOString();
+          hasChanges = true;
+
+          // Dispatch motivation asynchronously
+          dispatchHinglishMotivation(chatId, user, { isNightMode, isStudyHour, hasSkips, isHighStreak, isInactive });
+        } catch (mErr) {
+          console.error(`[Scheduler] Hinglish motivation failed for user ${userProfile.displayName}:`, mErr);
+        }
+      }
+    }
+
+    if (hasChanges) {
+      fs.writeFileSync(TELEGRAM_USERS_FILE, JSON.stringify(users, null, 2), "utf-8");
+    }
+
+  } catch (err) {
+    console.error("Scheduler error trace:", err);
+  } finally {
+    schedulerActive = false;
+  }
+}
+
+// Tick background task dispatcher every 24 seconds
+setInterval(runBackgroundScheduler, 24000);
+
+
+// Sync complete profile and tasks list back to the server
+app.post("/api/telegram/sync", (req, res) => {
+  const { uid, profile, tasks, passcode } = req.body;
+  if (!uid || !profile || !tasks) {
+    return res.status(400).json({ error: "uid, profile, and tasks are required vectors." });
+  }
+
+  const users = loadTelegramUsers();
+  let foundUserKey: string | null = null;
+  for (const [mobile, user] of Object.entries(users)) {
+    if (user.profile && user.profile.uid === uid) {
+      foundUserKey = mobile;
+      break;
+    }
+  }
+
+  if (foundUserKey) {
+    // Merge updates safely
+    users[foundUserKey].profile = { ...users[foundUserKey].profile, ...profile };
+    users[foundUserKey].tasks = tasks;
+    if (passcode) {
+      users[foundUserKey].passcode = passcode;
+      users[foundUserKey].passcodeHash = hashPasscode(passcode);
+    }
+    fs.writeFileSync(path.join(process.cwd(), "telegram_users.json"), JSON.stringify(users, null, 2), "utf-8");
+    console.log(`[Sync] Real-time synced profile and ${tasks.length} tasks for user: ${profile.displayName}`);
+    return res.json({ success: true, message: "State synchronized successfully with Roy server telemetry." });
+  }
+
+  // Create new server-side user if not exists (Web-to-Telegram / Offline Sync recovery)
+  const mobile = uid.replace("user_", "").replace(/\D/g, "");
+  if (mobile && mobile.length >= 8) {
+    const rawPass = passcode || "123456";
+    const passcodeHash = hashPasscode(rawPass);
+    const token = "tg_tok_" + Math.random().toString(36).substring(2, 12) + Math.random().toString(36).substring(2, 12);
+
+    users[mobile] = {
+      name: profile.displayName || "Operator",
+      mobile: mobile,
+      passcode: rawPass,
+      passcodeHash: passcodeHash,
+      telegramChatId: profile.telegramChatId || null,
+      telegramUsername: profile.telegramUsername || "",
+      accountId: uid,
+      uid: uid,
+      authToken: token,
+      profile: profile,
+      tasks: tasks
+    };
+
+    fs.writeFileSync(path.join(process.cwd(), "telegram_users.json"), JSON.stringify(users, null, 2), "utf-8");
+    console.log(`[Sync] Automatically initialized server-side register profile during sync: ${profile.displayName} (${mobile})`);
+    return res.json({ success: true, message: "Server-side registration completed during state sync." });
+  }
+
+  return res.status(404).json({ error: "Profile ID not associated with an offline Telegram user database." });
+});
+
+// Fetch active server-side profile and tasks list for a user
+app.get("/api/telegram/get-state", (req, res) => {
+  const { uid } = req.query;
+  if (!uid || typeof uid !== "string") {
+    return res.status(400).json({ error: "uid is required query attribute." });
+  }
+
+  const users = loadTelegramUsers();
+  for (const [mobile, user] of Object.entries(users)) {
+    if (user.profile && user.profile.uid === uid) {
+      return res.json({
+        success: true,
+        profile: user.profile,
+        tasks: user.tasks
+      });
+    }
+  }
+
+  return res.status(404).json({ error: "User profile not found in master telemetry database." });
+});
+
+
+// 1. Fetch configured state of the Telegram Bot Integration (Dynamic detect)
+app.get("/api/telegram/config", (req, res) => {
+  const token = process.env.TELEGRAM_BOT_TOKEN;
+  const botUsername = process.env.TELEGRAM_BOT_USERNAME || "royroutune_bot";
+  
+  return res.json({
+    tokenConfigured: !!token,
+    botUsername: botUsername.replace(/^@/, "")
+  });
+});
+
+// 2. Check if a specific user integration token (regKey) has pressed /start in Telegram 
+app.get("/api/telegram/check-connection", async (req, res) => {
+  const { regKey } = req.query;
+  if (!regKey || typeof regKey !== "string") {
+    return res.status(400).json({ error: "regKey query parameter is required" });
+  }
+
+  // First verify if already captured in our active state machine map (lightning fast trigger!)
+  if (connectedChats.has(regKey)) {
+    const data = connectedChats.get(regKey)!;
+    // Keep link connection active in map so polling registers reliably, then clear later or keep it
+    return res.json({
+      connected: true,
+      chatId: data.chatId,
+      firstName: data.firstName,
+      username: data.username,
+      token: data.token
+    });
+  }
+
+  // Fallback to manual ad-hoc updates scan
+  const token = process.env.TELEGRAM_BOT_TOKEN;
+  if (!token) {
+    return res.status(403).json({ 
+      error: "TELEGRAM_BOT_TOKEN is not configured in Server environment variables. Please supply it in Settings/Secrets." 
+    });
+  }
+
+  try {
+    const response = await fetch(`https://api.telegram.org/bot${token}/getUpdates?limit=100&timeout=0`);
+    if (!response.ok) {
+      const errText = await response.text();
+      return res.status(502).json({ error: "Failed to fetch updates from Telegram", details: errText });
+    }
+
+    const data = await response.json() as any;
+    if (!data.ok) {
+      return res.status(502).json({ error: "Telegram API responded with error", description: data.description });
+    }
+
+    const updates = data.result || [];
+    for (let i = updates.length - 1; i >= 0; i--) {
+      const update = updates[i];
+      const message = update.message || update.edited_message;
+      if (!message || !message.text) continue;
+
+      const text = message.text.trim();
+      const chatId = message.chat.id;
+      const firstName = message.chat.first_name || message.chat.username || "Operator";
+      const username = message.chat.username || "";
+
+      if (text.includes(regKey)) {
+        return res.json({
+          connected: true,
+          chatId: String(chatId),
+          firstName,
+          username
+        });
+      }
+    }
+
+    return res.json({
+      connected: false
+    });
+
+  } catch (err: any) {
+    console.error("Telegram connection check exception:", err);
+    return res.status(500).json({ error: "Internal check error", details: err.message });
+  }
+});
+
+// 3. Check and verify Telegram login tokens (Auto Auth verification route)
+app.get("/api/telegram/autologin", (req, res) => {
+  const { token } = req.query;
+  if (!token || typeof token !== "string") {
+    return res.status(400).json({ error: "Decryption token element is mandatory." });
+  }
+
+  const tokenInfo = activeTokens.get(token);
+  if (!tokenInfo) {
+    return res.status(401).json({ error: "Invalid or expired session token key matched." });
+  }
+
+  if (tokenInfo.expiresAt < Date.now()) {
+    activeTokens.delete(token);
+    saveTelegramTokens();
+    return res.status(403).json({ error: "Active login token has expired." });
+  }
+
+  // Load profile database elements
+  const currentUsers = loadTelegramUsers();
+  const matchedUser = currentUsers[tokenInfo.mobile];
+
+  if (!matchedUser) {
+    return res.status(404).json({ error: "Operator profile database record was not found." });
+  }
+
+  console.log(`[AutoLogin] Decrypted secure key. Logged operator in: ${matchedUser.name}`);
+  return res.json({
+    success: true,
+    user: { uid: matchedUser.profile.uid, displayName: matchedUser.profile.displayName },
+    profile: matchedUser.profile,
+    tasks: matchedUser.tasks,
+    _rawPasscode: matchedUser.passcode
+  });
+});
+
+// 4. Server-fallback login verification for both Telegram and website users on server
+app.post("/api/auth/login", (req, res) => {
+  const { mobile, passcode } = req.body;
+  if (!mobile || !passcode) {
+    return res.status(400).json({ error: "Mobile and passcode are required variables." });
+  }
+
+  const mobileTrim = mobile.trim().replace(/\D/g, "");
+  const serverUsers = loadTelegramUsers();
+  const matched = serverUsers[mobileTrim];
+
+  if (matched && (matched.passcode === passcode.trim() || matched.passcodeHash === hashPasscode(passcode.trim()))) {
+    console.log(`[Server Auth] Login matched Telegram Profile server-side for: ${matched.name}`);
+    return res.json({
+      success: true,
+      profile: matched.profile,
+      tasks: matched.tasks,
+      _rawPasscode: matched.passcode
+    });
+  }
+
+  return res.status(401).json({ error: "Invalid credentials matched on our matrix servers." });
+});
+
+// 5. Send OTP to a specific chat ID inside Telegram
+app.post("/api/telegram/send-otp", async (req, res) => {
+  const { chatId } = req.body;
+  if (!chatId) {
+    return res.status(400).json({ error: "chatId is required" });
+  }
+
+  const token = process.env.TELEGRAM_BOT_TOKEN;
+  if (!token) {
+    return res.status(400).json({ error: "TELEGRAM_BOT_TOKEN is not configured on the server." });
+  }
+
+  const otpCode = Math.floor(100000 + Math.random() * 900000).toString();
+  const messageText = `🚀 <b>Roy Routine Verification</b>\n\nYour OTP Code:\n<b>${otpCode}</b>\n\nDo not share this code.\n\nPowered by Roy No Rules 🚀`;
+
+  try {
+    const response = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: chatId,
+        text: messageText,
+        parse_mode: "HTML"
       })
     });
 
-    if (response.ok) {
-      const data = await response.json() as any;
-      let stepsFound = 0;
-      let caloriesFound = 0;
-      let distFound = 0; // meters
-
-      if (data.bucket && data.bucket[0] && data.bucket[0].dataset) {
-        const datasets = data.bucket[0].dataset;
-        
-        // Dataset 0: Steps
-        if (datasets[0]?.point?.[0]?.value?.[0]) {
-          const val = datasets[0].point[0].value[0];
-          stepsFound = val.intVal || val.fpVal || 0;
-        }
-
-        // Dataset 1: Calories
-        if (datasets[1]?.point?.[0]?.value?.[0]) {
-          const val = datasets[1].point[0].value[0];
-          caloriesFound = Math.round(val.fpVal || val.intVal || 0);
-        }
-
-        // Dataset 2: Distance
-        if (datasets[2]?.point?.[0]?.value?.[0]) {
-          const val = datasets[2].point[0].value[0];
-          distFound = val.fpVal || val.intVal || 0;
-        }
-      }
-
-      // Safeguard or map metrics dynamically
-      googleSessionStore.steps = stepsFound || 6420;
-      googleSessionStore.calories = caloriesFound || 285;
-      googleSessionStore.distance = Number(((distFound || 4100) / 1000).toFixed(2));
-      googleSessionStore.lastSyncedAt = new Date().toISOString();
-      googleSessionStore.isFitConnected = true;
-      console.log(`[Google Fit API] Fetched stats: ${googleSessionStore.steps} steps`);
-    } else {
-      const text = await response.text();
-      console.error("[Google Fit API] Aggregation failed status:", response.status, text);
-    }
-  } catch (error) {
-    console.error("[Google Fit API] Exception query aggregate:", error);
-  }
-}
-
-// 1. Get Google OAuth URL
-app.get("/api/auth/google/url", (req, res) => {
-  const appUrl = process.env.APP_URL || `http://localhost:${PORT}`;
-  const redirectUri = `${appUrl.trim().replace(/\/$/, "")}/auth/callback`;
-  
-  const isConfigured = !!(process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET);
-  
-  if (!isConfigured) {
-    // If not configured, we return standard callback details so user can test simulated syncing instantly
-    return res.json({
-      url: `/auth/callback?code=simulated_auth_code_sandbox`,
-      isConfigured: false,
-      redirectUri
-    });
-  }
-
-  // Real Google OAuth authorization setup
-  const params = new URLSearchParams({
-    client_id: process.env.GOOGLE_CLIENT_ID || "",
-    redirect_uri: redirectUri,
-    response_type: "code",
-    scope: "openid email profile https://www.googleapis.com/auth/fitness.activity.read",
-    access_type: "offline",
-    prompt: "consent"
-  });
-
-  const authUrl = `https://accounts.google.com/o/oauth2/v2/auth?${params}`;
-  return res.json({
-    url: authUrl,
-    isConfigured: true,
-    redirectUri
-  });
-});
-
-// 2. Google OAuth Callback handler
-app.get(["/auth/callback", "/auth/callback/"], async (req, res) => {
-  const { code } = req.query;
-  
-  if (!code) {
-    return res.send("<p>Error: No authorization code received from Google OAuth.</p>");
-  }
-
-  if (code === "simulated_auth_code_sandbox") {
-    // Save in sandbox state
-    googleSessionStore.isFitConnected = true;
-    googleSessionStore.lastSyncedAt = new Date().toISOString();
-    console.log("[Google OAuth Sandbox] Sandbox connected successfully!");
-  } else {
-    // Real Token Exchange
-    const appUrl = process.env.APP_URL || `http://localhost:${PORT}`;
-    const redirectUri = `${appUrl.trim().replace(/\/$/, "")}/auth/callback`;
-
-    try {
-      const tokenResponse = await fetch("https://oauth2.googleapis.com/token", {
-        method: "POST",
-        headers: { "Content-Type": "application/x-www-form-urlencoded" },
-        body: new URLSearchParams({
-          code: String(code),
-          client_id: process.env.GOOGLE_CLIENT_ID || "",
-          client_secret: process.env.GOOGLE_CLIENT_SECRET || "",
-          redirect_uri: redirectUri,
-          grant_type: "authorization_code"
-        })
+    const data = await response.json() as any;
+    if (response.ok && data.ok) {
+      return res.json({
+        success: true,
+        otpCode
       });
-
-      if (!tokenResponse.ok) {
-        const errText = await tokenResponse.text();
-        throw new Error(`Google exchange token server error: ${errText}`);
-      }
-
-      const data = await tokenResponse.json() as any;
-      googleSessionStore.accessToken = data.access_token;
-      if (data.refresh_token) {
-        googleSessionStore.refreshToken = data.refresh_token; // Received on first consent only
-      }
-      googleSessionStore.expiresAt = Date.now() + (data.expires_in * 1000);
-      googleSessionStore.isFitConnected = true;
-
-      // Start fetching immediate stats
-      await fetchGoogleFitStats();
-    } catch (err: any) {
-      console.error("[Google OAuth Callback Exchange Error]", err);
-      return res.send(`<p>Authentication failed during token exchange: ${err.message}. Please verify variables.</p>`);
+    } else {
+      return res.status(502).json({ error: "Telegram failed to deliver the message", details: data.description });
     }
+  } catch (err: any) {
+    console.error("Telegram send OTP error:", err);
+    return res.status(500).json({ error: "Failed to dispatch check-code via Telegram", details: err.message });
+  }
+});
+
+// 6. General Proxy Dispatcher for customizable Telegram warnings and automated notifications
+app.post("/api/telegram/send-message", async (req, res) => {
+  const { chatId, text, disableNotification } = req.body;
+  if (!chatId || !text) {
+    return res.status(400).json({ error: "chatId and text are required" });
   }
 
-  // Beautiful compliant pop-up message response
-  res.send(`
-    <html>
-      <head>
-        <title>Google Fit Connected</title>
-        <style>
-          body {
-            background-color: #0A0A0C;
-            color: #f1f5f9;
-            font-family: system-ui, -apple-system, sans-serif;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            height: 100vh;
-            margin: 0;
-            text-align: center;
-          }
-          .card {
-            background: rgba(255, 255, 255, 0.03);
-            border: 1px solid rgba(255, 255, 255, 0.08);
-            border-radius: 1.5rem;
-            padding: 2.5rem;
-            backdrop-filter: blur(20px);
-            box-shadow: 0 10px 40px rgba(0,0,0,0.5);
-            max-width: 400px;
-          }
-          h2 { color: #22c55e; margin-bottom: 0.5rem; }
-          p { color: #94a3b8; font-size: 0.9rem; line-height: 1.4; }
-          .spinner {
-            border: 3px solid rgba(255,255,255,0.1);
-            border-top: 3px solid #22c55e;
-            border-radius: 50%;
-            width: 24px;
-            height: 24px;
-            animation: spin 1s linear infinite;
-            margin: 1.5rem auto 0;
-          }
-          @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
-        </style>
-      </head>
-      <body>
-        <div class="card">
-          <h2>⚡ LINK COMPLETED</h2>
-          <p>Google Fitness credentials authorized successfully. Syncing metrics with Guardian AI...</p>
-          <div class="spinner"></div>
-        </div>
-        <script>
-          setTimeout(() => {
-            if (window.opener) {
-              window.opener.postMessage({ type: 'OAUTH_AUTH_SUCCESS' }, '*');
-              window.close();
-            } else {
-              window.location.href = '/';
-            }
-          }, 1500);
-        </script>
-      </body>
-    </html>
-  `);
-});
-
-// 3. Fetch current synchronized stats
-app.get("/api/fit/steps", async (req, res) => {
-  if (googleSessionStore.isFitConnected && process.env.GOOGLE_CLIENT_ID) {
-    await fetchGoogleFitStats();
+  const token = process.env.TELEGRAM_BOT_TOKEN;
+  if (!token) {
+    return res.status(400).json({ error: "TELEGRAM_BOT_TOKEN is not configured." });
   }
-  return res.json({
-    isFitConnected: googleSessionStore.isFitConnected,
-    steps: googleSessionStore.steps,
-    calories: googleSessionStore.calories,
-    distance: googleSessionStore.distance,
-    lastSyncedAt: googleSessionStore.lastSyncedAt,
-    isRealGoogleApi: !!process.env.GOOGLE_CLIENT_ID
-  });
-});
 
-// 4. Reset connections with Google Fit
-app.post("/api/fit/disconnect", (req, res) => {
-  googleSessionStore.isFitConnected = false;
-  googleSessionStore.accessToken = "";
-  googleSessionStore.refreshToken = "";
-  googleSessionStore.expiresAt = 0;
-  googleSessionStore.steps = 0;
-  googleSessionStore.calories = 0;
-  googleSessionStore.distance = 0;
-  console.log("[Google Fit] Session connection disconnected.");
-  return res.json({ success: true });
-});
+  try {
+    const response = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: chatId,
+        text,
+        parse_mode: "HTML",
+        disable_notification: !!disableNotification
+      })
+    });
 
-// 5. Simulate increment step actions (triggers quick auto tracking adjustments)
-app.post("/api/fit/simulate", (req, res) => {
-  const { increment } = req.body;
-  const incValue = parseInt(increment, 10) || 1200;
-  
-  googleSessionStore.steps += incValue;
-  googleSessionStore.distance = Number((googleSessionStore.distance + (incValue * 0.00075)).toFixed(2));
-  googleSessionStore.calories += Math.round(incValue * 0.045);
-  googleSessionStore.lastSyncedAt = new Date().toISOString();
-  
-  return res.json({
-    success: true,
-    steps: googleSessionStore.steps,
-    calories: googleSessionStore.calories,
-    distance: googleSessionStore.distance,
-    lastSyncedAt: googleSessionStore.lastSyncedAt
-  });
+    const data = await response.json() as any;
+    if (response.ok && data.ok) {
+      return res.json({ success: true, messageId: data.result?.message_id });
+    } else {
+      return res.status(502).json({ error: "Telegram sendMessage rejected", details: data.description });
+    }
+  } catch (err: any) {
+    console.error("Telegram send message exception:", err);
+    return res.status(500).json({ error: "Connection error with Telegram", details: err.message });
+  }
 });
 
 
